@@ -31,6 +31,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -38,6 +39,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -58,6 +62,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.DialogProperties
 
 // ------------------------------------------------------------------ الألوان
 val Bg = Color(0xFF080B10)
@@ -236,6 +241,10 @@ fun HomeScreen(vm: MainVM) {
     val ctx = LocalContext.current
     val m = vm.meta
 
+    // التنبيه يظهر عند كل دخول للتطبيق
+    var showNotice by rememberSaveable { mutableStateOf(true) }
+    var showPrivacy by rememberSaveable { mutableStateOf(false) }
+
     Box(
         Modifier
             .fillMaxSize()
@@ -264,14 +273,15 @@ fun HomeScreen(vm: MainVM) {
                 .padding(horizontal = 18.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // ---- الترويسة
+            // ---- الترويسة (سياسة الخصوصية أعلى اليسار)
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                AppLogo(logoSize = 46.dp)
-                Spacer(Modifier.width(12.dp))
-                Column {
-                    GradText("محمّل الفيديو", 22.sp)
-                    Text("VIDEO DOWNLOADER", color = TextDim, fontSize = 10.sp, letterSpacing = 2.sp)
+                AppLogo(logoSize = 40.dp)
+                Spacer(Modifier.width(10.dp))
+                Column(Modifier.weight(1f)) {
+                    GradText("محمّل الفيديو", 20.sp)
+                    Text("VIDEO DOWNLOADER", color = TextDim, fontSize = 9.sp, letterSpacing = 1.sp)
                 }
+                PrivacyPill { showPrivacy = true }
             }
 
             // ---- صنع في العراق
@@ -464,21 +474,48 @@ fun HomeScreen(vm: MainVM) {
                 }
             }
 
-            // ---- أسفل الصفحة
+            // ---- تحديث المحرك
             TextButton(onClick = { vm.updateEngine() }, enabled = !vm.busy && !vm.downloading) {
                 Text("تحديث محرك التحميل (إذا توقف موقع عن العمل)", color = TextDim, fontSize = 12.sp)
             }
-            Column(Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                GradText("صُنع في العراق ♥", 15.sp)
-                Spacer(Modifier.height(6.dp))
-                Text(
-                    "للاستخدام الشخصي فقط. احترم حقوق صاحب المحتوى وشروط كل منصة.",
-                    color = TextDim,
-                    fontSize = 11.sp,
-                    textAlign = TextAlign.Center
-                )
-            }
             Spacer(Modifier.height(12.dp))
         }
+    }
+
+    // ---- نافذة سياسة الخصوصية
+    if (showPrivacy) {
+        PrivacyDialog(onClose = { showPrivacy = false })
+    }
+
+    // ---- التنبيه الدائم عند كل دخول
+    if (showNotice) {
+        AlertDialog(
+            onDismissRequest = {},
+            properties = DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false),
+            containerColor = Panel2,
+            icon = { Text("⚠️", fontSize = 28.sp) },
+            title = {
+                Text(
+                    "تنبيه",
+                    color = Color.White,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            text = {
+                Text(
+                    "للاستخدام الشخصي فقط.\nاحترم صاحب المحتوى وشروط كل منصة.",
+                    color = Color(0xFFD7DEE8),
+                    fontSize = 16.sp,
+                    lineHeight = 27.sp,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            confirmButton = {
+                GradientButton("موافق", Modifier.fillMaxWidth()) { showNotice = false }
+            }
+        )
     }
 }
