@@ -160,7 +160,6 @@ class MainVM(app: Application) : AndroidViewModel(app) {
                 addOption("-f", f)
                 addOption("--merge-output-format", "mp4")
                 addOption("--remux-video", "mp4")
-                // وضع معلومات التشغيل في بداية الملف لتوافق أفضل مع المعارض
                 addOption("--postprocessor-args", "Merger+ffmpeg_o:-movflags +faststart")
             }
         }
@@ -179,10 +178,23 @@ class MainVM(app: Application) : AndroidViewModel(app) {
 
         val okExt = setOf("mp4", "mp3", "m4a", "mkv", "webm")
         val inter = Regex("\\.f\\d+")
-        val f = tmp.listFiles()
+        var f = tmp.listFiles()
             ?.filter { it.isFile && it.length() > 0 && it.extension.lowercase() in okExt && !inter.containsMatchIn(it.name) }
             ?.maxByOrNull { it.length() }
             ?: throw IllegalStateException("لم يكتمل التحميل أو الدمج. اضغط «تحديث محرك التحميل» ثم أعد المحاولة.")
+
+        // إعادة كتابة الحاوية بصيغة MP4 القياسية لأندرويد (بدون إعادة ترميز) لضمان عمله في المعرض
+        if (!q.isAudioOnly && f.extension.lowercase() == "mp4") {
+            status = "جارٍ تجهيز الفيديو ليعمل في المعرض..."
+            etaText = ""
+            val fixed = File(tmp, "fixed.mp4")
+            if (Remux.toStandardMp4(f, fixed) && probe(fixed) != null) {
+                f.delete()
+                f = fixed
+            } else {
+                fixed.delete()
+            }
+        }
 
         // التحقق من أن الملف صالح للتشغيل فعلاً
         val p = probe(f)
@@ -190,6 +202,7 @@ class MainVM(app: Application) : AndroidViewModel(app) {
             f.delete()
             throw IllegalStateException("الملف الناتج غير صالح للتشغيل. جرّب جودة أخرى.")
         }
+        val codec = if (q.isAudioOnly) "" else Remux.videoCodec(f.absolutePath)
 
         val mime = when (f.extension.lowercase()) {
             "mp4" -> "video/mp4"
@@ -202,15 +215,19 @@ class MainVM(app: Application) : AndroidViewModel(app) {
         val isAudio = mime.startsWith("audio")
         val uri = saveToMediaStore(ctx, f, mime, isAudio, title)
             ?: throw IllegalStateException("تعذر حفظ الملف على الجهاز")
-        f.delete()
         tmp.deleteRecursively()
 
         val dur = fmtDuration(p.durationMs / 1000)
         val info = if (q.isAudioOnly) {
             "ملف صوتي • المدة $dur"
         } else {
-            "الدقة الفعلية ${p.width}×${p.height} • المدة $dur" +
-                if (!p.hasAudio) "\n⚠ هذا الفيديو بدون صوت" else ""
+            var s = "الدقة الفعلية ${p.width}×${p.height} • المدة $dur"
+            if (codec.isNotEmpty()) s += "\nالترميز: $codec"
+            if (codec == "VP9" || codec == "VP8" || codec == "AV1") {
+                s += "\n⚠ هذا الترميز قد لا يعمل في المعرض، استخدم «تشغيل الملف»"
+            }
+            if (!p.hasAudio) s += "\n⚠ هذا الفيديو بدون صوت"
+            s
         }
         return Saved(uri, mime, info)
     }
