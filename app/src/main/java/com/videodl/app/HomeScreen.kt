@@ -31,7 +31,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -62,7 +61,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.DialogProperties
 
 // ------------------------------------------------------------------ الألوان
 val Bg = Color(0xFF080B10)
@@ -241,8 +239,6 @@ fun HomeScreen(vm: MainVM) {
     val ctx = LocalContext.current
     val m = vm.meta
 
-    // التنبيه يظهر عند كل دخول للتطبيق
-    var showNotice by rememberSaveable { mutableStateOf(true) }
     var showPrivacy by rememberSaveable { mutableStateOf(false) }
 
     Box(
@@ -485,37 +481,5 @@ fun HomeScreen(vm: MainVM) {
     // ---- نافذة سياسة الخصوصية
     if (showPrivacy) {
         PrivacyDialog(onClose = { showPrivacy = false })
-    }
-
-    // ---- التنبيه الدائم عند كل دخول
-    if (showNotice) {
-        AlertDialog(
-            onDismissRequest = {},
-            properties = DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false),
-            containerColor = Panel2,
-            icon = { Text("⚠️", fontSize = 28.sp) },
-            title = {
-                Text(
-                    "تنبيه",
-                    color = Color.White,
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            },
-            text = {
-                Text(
-                    "للاستخدام الشخصي فقط.\nاحترم صاحب المحتوى وشروط كل منصة.",
-                    color = Color(0xFFD7DEE8),
-                    fontSize = 16.sp,
-                    lineHeight = 27.sp,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth()
-                )
-            },
-            confirmButton = {
-                GradientButton("موافق", Modifier.fillMaxWidth()) { showNotice = false }
-            }
-        )
     }
 }
