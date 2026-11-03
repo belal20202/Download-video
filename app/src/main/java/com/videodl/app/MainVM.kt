@@ -22,6 +22,9 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 internal class Probe(val width: Int, val height: Int, val durationMs: Long, val hasAudio: Boolean)
 internal class Saved(val uri: Uri, val mime: String, val info: String)
@@ -110,11 +113,12 @@ class MainVM(app: Application) : AndroidViewModel(app) {
             dua = Duas.next()
             status = "جارٍ التحميل بجودة ${q.label}..."
             try {
-                val saved = withContext(Dispatchers.IO) { runDownload(ctx, u, q) }
+                val saved = withContext(Dispatchers.IO) { runDownload(ctx, u, q, m.title) }
                 savedUri = saved.uri
                 savedMime = saved.mime
                 progress = 1f
-                status = "تم الحفظ ✅ في: Download/VideoDL\n${saved.info}"
+                val folder = if (q.isAudioOnly) "Music/VideoDL" else "Movies/VideoDL"
+                status = "تم الحفظ ✅ في: $folder (يظهر في المعرض)\n${saved.info}"
             } catch (e: Exception) {
                 progress = 0f
                 if (cancelled) {
@@ -137,15 +141,15 @@ class MainVM(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun runDownload(ctx: Context, u: String, q: Quality): Saved {
+    private fun runDownload(ctx: Context, u: String, q: Quality, title: String): Saved {
         App.initThread.join()
         val tmp = File(ctx.cacheDir, "dl").apply { deleteRecursively(); mkdirs() }
 
         val req = YoutubeDLRequest(u).apply {
             addOption("--no-playlist")
             addOption("--no-mtime")
-            addOption("--windows-filenames")
-            addOption("-o", "${tmp.absolutePath}/%(title).70s.%(ext)s")
+            // اسم مؤقت بسيط لتجنب مشاكل الرموز في الأسماء
+            addOption("-o", "${tmp.absolutePath}/video.%(ext)s")
             if (q.isAudioOnly) {
                 addOption("-f", q.formatId)
                 addOption("-x")
@@ -156,6 +160,8 @@ class MainVM(app: Application) : AndroidViewModel(app) {
                 addOption("-f", f)
                 addOption("--merge-output-format", "mp4")
                 addOption("--remux-video", "mp4")
+                // وضع معلومات التشغيل في بداية الملف لتوافق أفضل مع المعارض
+                addOption("--postprocessor-args", "Merger+ffmpeg_o:-movflags +faststart")
             }
         }
 
@@ -193,8 +199,9 @@ class MainVM(app: Application) : AndroidViewModel(app) {
             "m4a" -> "audio/mp4"
             else -> "application/octet-stream"
         }
-        val uri = saveToDownloads(ctx, f, mime)
-            ?: throw IllegalStateException("تعذر حفظ الملف في مجلد التنزيلات")
+        val isAudio = mime.startsWith("audio")
+        val uri = saveToMediaStore(ctx, f, mime, isAudio, title)
+            ?: throw IllegalStateException("تعذر حفظ الملف على الجهاز")
         f.delete()
         tmp.deleteRecursively()
 
@@ -228,18 +235,33 @@ class MainVM(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun saveToDownloads(ctx: Context, f: File, mime: String): Uri? {
+    /** الحفظ في قسم الفيديو/الصوت الرسمي حتى يتعرف عليه المعرض ويشغّله. */
+    private fun saveToMediaStore(ctx: Context, f: File, mime: String, isAudio: Boolean, title: String): Uri? {
+        val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val name = "VideoDL_$stamp.${f.extension.lowercase()}"
+        val collection = if (isAudio) {
+            MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        } else {
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        }
         val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, f.name)
-            put(MediaStore.Downloads.MIME_TYPE, mime)
-            put(MediaStore.Downloads.RELATIVE_PATH, "Download/VideoDL")
-            put(MediaStore.Downloads.IS_PENDING, 1)
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.TITLE, title)
+            put(MediaStore.MediaColumns.MIME_TYPE, mime)
+            put(MediaStore.MediaColumns.RELATIVE_PATH, if (isAudio) "Music/VideoDL" else "Movies/VideoDL")
+            put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
         val r = ctx.contentResolver
-        val uri = r.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
-        r.openOutputStream(uri)?.use { out -> f.inputStream().use { it.copyTo(out) } }
+        val uri = r.insert(collection, values) ?: return null
+        try {
+            r.openOutputStream(uri)?.use { out -> f.inputStream().use { it.copyTo(out) } }
+                ?: run { r.delete(uri, null, null); return null }
+        } catch (e: Exception) {
+            r.delete(uri, null, null)
+            throw e
+        }
         values.clear()
-        values.put(MediaStore.Downloads.IS_PENDING, 0)
+        values.put(MediaStore.MediaColumns.IS_PENDING, 0)
         r.update(uri, values, null, null)
         return uri
     }
