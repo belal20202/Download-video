@@ -2,7 +2,6 @@ package com.videodl.app
 
 import android.app.Application
 import android.content.ContentValues
-import android.content.Context
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
 import android.media.MediaScannerConnection
@@ -13,14 +12,17 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
-import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.viewModelScope
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.text.SimpleDateFormat
@@ -43,7 +45,7 @@ internal class Attempt(
     val prep: String
 )
 
-internal class Saved(val uri: Uri, val mime: String, val info: String)
+internal class Saved(val uri: Uri, val mime: String, val info: String, val needsCompat: Boolean)
 
 // نسخة أكثر توافقاً: H.264 + AAC حتى 720p و30 إطار
 private const val SAFE_FORMAT =
@@ -51,8 +53,14 @@ private const val SAFE_FORMAT =
         "b[vcodec^=avc1][acodec^=mp4a][height<=?720]/" +
         "b[ext=mp4][height<=?720]/b[ext=mp4]"
 
-class MainVM(app: Application) : AndroidViewModel(app) {
+private const val MAX_THUMB_BYTES = 4 * 1024 * 1024
+
+/** حالة التطبيق: كائن واحد يعيش مع العملية (وليس مع الشاشة)، فلا يضيع التحميل عند الخروج. */
+class MainVM(private val app: Application) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
     var url by mutableStateOf("")
+        private set
     var meta by mutableStateOf<VideoMeta?>(null)
     var thumb by mutableStateOf<ImageBitmap?>(null)
     var selectedIndex by mutableStateOf(0)
@@ -65,41 +73,85 @@ class MainVM(app: Application) : AndroidViewModel(app) {
     var dua by mutableStateOf("")
     var savedUri by mutableStateOf<Uri?>(null)
     var savedMime by mutableStateOf("video/mp4")
+    var offerCompat by mutableStateOf(false)
 
     private val processId = "videodl-main"
 
     @Volatile
     private var cancelled = false
 
+    // الرابط الذي تم التعرف عليه فعلاً: التحميل يستخدمه هو فقط
+    private var fetchedUrl = ""
+    private var fetchId = 0
+    private var lastNotify = 0L
+
+    // https فقط
     private fun extractUrl(text: String): String? =
-        Regex("https?://\\S+").find(text.trim())?.value
+        Regex("https://\\S+", RegexOption.IGNORE_CASE).find(text.trim())?.value
 
     private fun awaitEngine() {
         App.initThread.join()
         App.initError?.let { throw IllegalStateException("تعذر تشغيل محرك التحميل: $it") }
     }
 
+    // ---------------------------------------------------------------- الرابط
+    fun onUrlChange(v: String) {
+        url = v
+        // إذا تغيّر الرابط عن الذي تم التعرف عليه، نخفي بطاقة الفيديو القديمة
+        if (!busy && !downloading && meta != null && extractUrl(v) != fetchedUrl) {
+            fetchId++
+            meta = null
+            thumb = null
+            offerCompat = false
+            savedUri = null
+            progress = 0f
+            dua = ""
+            isError = false
+            status = ""
+        }
+    }
+
+    /** رابط وصل عبر «مشاركة» من تطبيق آخر. */
+    fun receiveShared(text: String) {
+        val link = extractUrl(text)
+        if (link == null) {
+            isError = true
+            status = "الرابط المُشارَك غير مقبول (يجب أن يبدأ بـ https://)"
+            return
+        }
+        if (busy || downloading) {
+            isError = true
+            status = "انتظر انتهاء العملية الحالية ثم شارك الرابط مرة أخرى"
+            return
+        }
+        onUrlChange(link)
+        fetch()
+    }
+
     // ---------------------------------------------------------------- التعرف على الفيديو
     fun fetch() {
+        if (busy || downloading) return
         val u = extractUrl(url)
         if (u == null) {
             isError = true
             status = "الصق رابطاً صحيحاً يبدأ بـ https://"
             return
         }
-        if (busy || downloading) return
-        viewModelScope.launch {
+        val id = ++fetchId
+        scope.launch {
             busy = true
             isError = false
             meta = null
             thumb = null
             savedUri = null
+            offerCompat = false
             progress = 0f
             dua = ""
             status = "جارٍ التعرف على الفيديو..."
             try {
                 val parsed = withContext(Dispatchers.IO) {
                     awaitEngine()
+                    UrlGuard.check(u)?.let { throw IllegalStateException(it) }
                     val req = YoutubeDLRequest(u).apply {
                         addOption("--dump-single-json")
                         addOption("--no-playlist")
@@ -107,15 +159,21 @@ class MainVM(app: Application) : AndroidViewModel(app) {
                     }
                     VideoParser.parse(YoutubeDL.getInstance().execute(req).out)
                 }
+                fetchedUrl = u
                 meta = parsed
                 selectedIndex = parsed.qualities
                     .indexOfFirst { !it.isAudioOnly && it.res in 1..1080 }
                     .coerceAtLeast(0)
                 status = "تم التعرف على الفيديو. اختر الجودة ثم اضغط تحميل"
                 if (parsed.thumbnail.isNotEmpty()) {
-                    launch(Dispatchers.IO) { thumb = loadThumb(parsed.thumbnail) }
+                    launch(Dispatchers.IO) {
+                        val bmp = loadThumb(parsed.thumbnail)
+                        if (id == fetchId) thumb = bmp
+                    }
                 }
-            } catch (e: Exception) {
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
                 isError = true
                 status = friendly(e)
             }
@@ -124,39 +182,66 @@ class MainVM(app: Application) : AndroidViewModel(app) {
     }
 
     // ---------------------------------------------------------------- التحميل
-    fun download() {
+    fun download() = startDownload(compat = false)
+
+    fun downloadCompatible() = startDownload(compat = true)
+
+    private fun startDownload(compat: Boolean) {
         val m = meta ?: return
         val q = m.qualities.getOrNull(selectedIndex) ?: return
-        val u = extractUrl(url) ?: return
-        if (downloading || busy) return
-        val ctx = getApplication<Application>()
+        val u = fetchedUrl
+        if (u.isEmpty() || downloading || busy) return
+        val previous = if (compat) savedUri else null
         cancelled = false
-        viewModelScope.launch {
+        scope.launch {
             downloading = true
             isError = false
             progress = 0f
             etaText = ""
-            savedUri = null
+            offerCompat = false
+            if (!compat) savedUri = null
             dua = Duas.next()
-            status = "جارٍ التحميل بجودة ${q.label}..."
+            status = if (compat) "جارٍ تنزيل نسخة متوافقة (H.264 حتى 720p)..."
+            else "جارٍ التحميل بجودة ${q.label}..."
+            DownloadService.start(app)
+            var ok = false
+            var finalText = ""
             try {
-                val saved = withContext(Dispatchers.IO) { runDownload(ctx, u, q, m.title) }
+                val saved = withContext(Dispatchers.IO) { runDownload(u, q, m.title, compat) }
                 savedUri = saved.uri
                 savedMime = saved.mime
                 progress = 1f
                 val folder = if (q.isAudioOnly) "Music/VideoDL" else "Movies/VideoDL"
                 status = "تم الحفظ ✅ في: $folder (يظهر في المعرض)\n${saved.info}"
-            } catch (e: Exception) {
+                offerCompat = saved.needsCompat
+                if (previous != null) {
+                    // النسخة المتوافقة نجحت: نحذف الملف القديم الذي أنشأناه نحن
+                    try {
+                        app.contentResolver.delete(previous, null, null)
+                    } catch (_: Exception) {
+                    }
+                }
+                ok = true
+                finalText = m.title
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
                 progress = 0f
+                offerCompat = compat && savedUri != null
                 if (cancelled) {
                     status = "تم إلغاء التحميل"
                 } else {
                     isError = true
                     status = friendly(e)
+                    finalText = status.lineSequence().first().take(90)
                 }
+            } finally {
+                downloading = false
+                etaText = ""
+                DownloadService.stop(app)
+                if (!cancelled) DownloadNotifier.finished(app, ok, finalText)
+                Thread { cleanTemp() }.start()
             }
-            downloading = false
-            etaText = ""
         }
     }
 
@@ -168,34 +253,40 @@ class MainVM(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun runDownload(ctx: Context, u: String, q: Quality, title: String): Saved {
-        awaitEngine()
-        val dirA = File(ctx.cacheDir, "dl")
-        val dirB = File(ctx.cacheDir, "dl_safe")
-
-        var chosen = attempt(u, q, dirA, false)
-        var fellBack = false
-
-        // إذا ظهرت مشكلة توافق، ننزّل تلقائياً نسخة أكثر توافقاً
-        if (chosen.problems.isNotEmpty() && !q.isAudioOnly) {
-            status = "⚠ ${chosen.problems.first()}\nجارٍ تنزيل نسخة أكثر توافقاً مع المعرض..."
-            progress = 0f
-            etaText = ""
-            val b: Attempt? = try {
-                attempt(u, q, dirB, true)
-            } catch (e: Exception) {
-                if (cancelled) throw e
-                null
-            }
-            if (b != null && b.problems.size < chosen.problems.size) {
-                chosen.file.delete()
-                chosen = b
-                fellBack = true
-            }
+    private fun cleanTemp() {
+        try {
+            File(app.cacheDir, "dl").deleteRecursively()
+        } catch (_: Exception) {
         }
+    }
 
-        val f = chosen.file
-        val p = chosen.probe
+    private fun pushProgress() {
+        val now = System.currentTimeMillis()
+        if (now - lastNotify < 1000) return
+        lastNotify = now
+        val pct = (progress * 100).toInt()
+        DownloadNotifier.progress(app, pct, if (etaText.isNotEmpty()) "$pct% • $etaText" else "$pct%")
+    }
+
+    private fun checkSpace(q: Quality) {
+        val need = if (q.sizeBytes > 0) (q.sizeBytes * 2.5).toLong() else 300L * 1024 * 1024
+        val free = app.cacheDir.usableSpace
+        if (free < need) {
+            throw IllegalStateException(
+                "المساحة الفارغة غير كافية (يلزم ≈ ${fmtSize(need)} والمتوفر ${fmtSize(free)})"
+            )
+        }
+    }
+
+    private fun runDownload(u: String, q: Quality, title: String, compat: Boolean): Saved {
+        awaitEngine()
+        UrlGuard.check(u)?.let { throw IllegalStateException(it) }
+        checkSpace(q)
+
+        val a = attempt(u, q, File(app.cacheDir, "dl"), compat)
+        val f = a.file
+        val p = a.probe
+
         val mime = when (f.extension.lowercase()) {
             "mp4" -> "video/mp4"
             "webm" -> "video/webm"
@@ -205,10 +296,8 @@ class MainVM(app: Application) : AndroidViewModel(app) {
             else -> "application/octet-stream"
         }
         val isAudio = mime.startsWith("audio")
-        val uri = saveToMediaStore(ctx, f, mime, isAudio, title)
+        val uri = saveToMediaStore(f, mime, isAudio, title)
             ?: throw IllegalStateException("تعذر حفظ الملف على الجهاز")
-        dirA.deleteRecursively()
-        dirB.deleteRecursively()
 
         val dur = fmtDuration(p.durationMs / 1000)
         val sb = StringBuilder()
@@ -216,16 +305,18 @@ class MainVM(app: Application) : AndroidViewModel(app) {
             sb.append("ملف صوتي • المدة ").append(dur)
         } else {
             sb.append("الدقة الفعلية ${p.width}×${p.height} • المدة ").append(dur)
-            chosen.report?.let { if (it.summary.isNotEmpty()) sb.append("\n").append(it.summary) }
-            sb.append("\nتجهيز الملف: ").append(chosen.prep)
-            if (fellBack) sb.append("\n↺ تم تنزيل نسخة أكثر توافقاً تلقائياً (H.264 حتى 720p)")
-            if (chosen.problems.isNotEmpty()) {
-                sb.append("\n⚠ ").append(chosen.problems.joinToString("، "))
-                sb.append("\nاستخدم «تشغيل الملف» لمشاهدته")
+            a.report?.let { if (it.summary.isNotEmpty()) sb.append("\n").append(it.summary) }
+            sb.append("\nتجهيز الملف: ").append(a.prep)
+            if (compat) sb.append("\n↺ نسخة متوافقة (H.264 حتى 720p)")
+            if (a.problems.isNotEmpty()) {
+                sb.append("\n⚠ ").append(a.problems.joinToString("، "))
+                sb.append("\nيمكنك مشاهدته بزر «تشغيل الملف»")
+                if (!compat) sb.append("، أو تنزيل نسخة متوافقة مع المعرض بالزر أدناه")
             }
             if (!p.hasAudio) sb.append("\n⚠ هذا الفيديو بدون صوت")
         }
-        return Saved(uri, mime, sb.toString())
+        val needsCompat = !compat && !q.isAudioOnly && a.problems.isNotEmpty()
+        return Saved(uri, mime, sb.toString(), needsCompat)
     }
 
     /** ينزّل الملف ويجهّزه ويفحصه. safe = نسخة H.264/AAC حتى 720p. */
@@ -268,6 +359,7 @@ class MainVM(app: Application) : AndroidViewModel(app) {
                 progress = ((stage + p / 100f) / stages).coerceIn(0f, 1f)
             }
             etaText = if (eta > 0) "المتبقي ≈ ${fmtDuration(eta)}" else ""
+            pushProgress()
         }
 
         val okExt = setOf("mp4", "mp3", "m4a", "mkv", "webm")
@@ -339,7 +431,7 @@ class MainVM(app: Application) : AndroidViewModel(app) {
     }
 
     /** الحفظ في قسم الفيديو/الصوت الرسمي ثم فهرسته ليتعرف عليه المعرض ويشغّله. */
-    private fun saveToMediaStore(ctx: Context, f: File, mime: String, isAudio: Boolean, title: String): Uri? {
+    private fun saveToMediaStore(f: File, mime: String, isAudio: Boolean, title: String): Uri? {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val name = "VideoDL_$stamp.${f.extension.lowercase()}"
         val collection = if (isAudio) {
@@ -355,7 +447,7 @@ class MainVM(app: Application) : AndroidViewModel(app) {
             put(MediaStore.MediaColumns.IS_PENDING, 1)
             if (!isAudio) put(MediaStore.Video.Media.DATE_TAKEN, System.currentTimeMillis())
         }
-        val r = ctx.contentResolver
+        val r = app.contentResolver
         val uri = r.insert(collection, values) ?: return null
         try {
             r.openOutputStream(uri)?.use { out -> f.inputStream().use { it.copyTo(out) } }
@@ -374,7 +466,7 @@ class MainVM(app: Application) : AndroidViewModel(app) {
                 if (c.moveToFirst()) {
                     val path = c.getString(0)
                     if (!path.isNullOrEmpty()) {
-                        MediaScannerConnection.scanFile(ctx, arrayOf(path), arrayOf(mime), null)
+                        MediaScannerConnection.scanFile(app, arrayOf(path), arrayOf(mime), null)
                     }
                 }
             }
@@ -386,17 +478,19 @@ class MainVM(app: Application) : AndroidViewModel(app) {
     // ---------------------------------------------------------------- تحديث المحرك
     fun updateEngine() {
         if (busy || downloading) return
-        viewModelScope.launch {
+        scope.launch {
             busy = true
             isError = false
             status = "جارٍ تحديث محرك التحميل..."
             try {
                 val r = withContext(Dispatchers.IO) {
                     App.initThread.join()
-                    YoutubeDL.getInstance().updateYoutubeDL(getApplication<Application>())
+                    YoutubeDL.getInstance().updateYoutubeDL(app)
                 }
                 status = "اكتمل التحديث: $r"
-            } catch (e: Exception) {
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
                 isError = true
                 status = "فشل التحديث: ${e.message?.take(150)}"
             }
@@ -404,20 +498,72 @@ class MainVM(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ---------------------------------------------------------------- مساعدات
-    private fun loadThumb(u: String): ImageBitmap? = try {
-        val c = URL(u).openConnection() as HttpURLConnection
-        c.connectTimeout = 8000
-        c.readTimeout = 8000
-        c.setRequestProperty("User-Agent", "Mozilla/5.0")
-        c.inputStream.use { BitmapFactory.decodeStream(it)?.asImageBitmap() }
-    } catch (e: Exception) {
-        null
+    // ---------------------------------------------------------------- الصورة المصغّرة (محصّنة)
+    /** https فقط، بدون عناوين داخلية، بحجم محدود، وتلتقط كل الأخطاء بما فيها نفاد الذاكرة. */
+    private fun loadThumb(first: String): ImageBitmap? {
+        var u = first
+        try {
+            repeat(4) {
+                if (UrlGuard.check(u) != null) return null
+                val c = URL(u).openConnection() as HttpURLConnection
+                c.instanceFollowRedirects = false
+                c.connectTimeout = 8000
+                c.readTimeout = 8000
+                c.setRequestProperty("User-Agent", "Mozilla/5.0")
+                val code = c.responseCode
+                if (code in 300..399) {
+                    val loc = c.getHeaderField("Location")
+                    c.disconnect()
+                    if (loc == null) return null
+                    u = URL(URL(u), loc).toString()
+                    return@repeat
+                }
+                if (code != 200 || c.contentLengthLong > MAX_THUMB_BYTES) {
+                    c.disconnect()
+                    return null
+                }
+                val bytes = readLimited(c.inputStream, MAX_THUMB_BYTES)
+                c.disconnect()
+                return if (bytes == null) null else decodeSmall(bytes)
+            }
+        } catch (e: Throwable) {
+            return null
+        }
+        return null
     }
 
-    private fun friendly(e: Exception): String {
+    private fun readLimited(s: InputStream, max: Int): ByteArray? {
+        val out = ByteArrayOutputStream()
+        val buf = ByteArray(8192)
+        var total = 0
+        s.use {
+            while (true) {
+                val n = it.read(buf)
+                if (n < 0) break
+                total += n
+                if (total > max) return null
+                out.write(buf, 0, n)
+            }
+        }
+        return out.toByteArray()
+    }
+
+    private fun decodeSmall(b: ByteArray): ImageBitmap? {
+        val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(b, 0, b.size, o)
+        if (o.outWidth <= 0 || o.outHeight <= 0) return null
+        if (o.outWidth.toLong() * o.outHeight > 50_000_000L) return null
+        var sample = 1
+        while (o.outWidth / sample > 1280 || o.outHeight / sample > 1280) sample *= 2
+        val o2 = BitmapFactory.Options().apply { inSampleSize = sample }
+        return BitmapFactory.decodeByteArray(b, 0, b.size, o2)?.asImageBitmap()
+    }
+
+    // ---------------------------------------------------------------- رسائل الأخطاء
+    private fun friendly(e: Throwable): String {
         val m = e.message ?: ""
         return when {
+            e is OutOfMemoryError -> "الذاكرة غير كافية لإكمال العملية"
             m.contains("Unsupported URL", true) -> "الرابط غير مدعوم"
             m.contains("Unable to resolve host", true) -> "تحقق من اتصال الإنترنت"
             m.contains("Sign in to confirm", true) -> "المنصة طلبت تحققاً. اضغط «تحديث محرك التحميل» ثم أعد المحاولة"
