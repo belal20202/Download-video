@@ -10,10 +10,35 @@ import java.nio.ByteBuffer
 object Remux {
 
     /**
-     * يعيد كتابة الفيديو بصيغة MP4 القياسية لأندرويد (بدون إعادة ترميز).
-     * يرجع true عند النجاح، وfalse عند الفشل (ويُحذف الملف الناتج).
+     * يعيد كتابة الفيديو بصيغة MP4 القياسية لأندرويد (بدون إعادة ترميز) مع تصفير بداية التوقيت.
+     * يرجع null عند النجاح، أو نصاً قصيراً يشرح سبب الفشل.
      */
-    fun toStandardMp4(src: File, dst: File): Boolean {
+    fun toStandardMp4(src: File, dst: File): String? {
+        // المرحلة 1: إيجاد أصغر زمن في الملف
+        var minUs = Long.MAX_VALUE
+        val scan = MediaExtractor()
+        try {
+            scan.setDataSource(src.absolutePath)
+            for (i in 0 until scan.trackCount) {
+                val mime = scan.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
+                if (mime.startsWith("video/") || mime.startsWith("audio/")) scan.selectTrack(i)
+            }
+            while (scan.sampleTrackIndex >= 0) {
+                val t = scan.sampleTime
+                if (t < minUs) minUs = t
+                if (!scan.advance()) break
+            }
+        } catch (e: Exception) {
+            return "قراءة الملف"
+        } finally {
+            try {
+                scan.release()
+            } catch (_: Exception) {
+            }
+        }
+        val base = if (minUs == Long.MAX_VALUE) 0L else minUs
+
+        // المرحلة 2: النسخ إلى حاوية جديدة
         val ex = MediaExtractor()
         var mux: MediaMuxer? = null
         var started = false
@@ -39,9 +64,9 @@ object Remux {
                     trackMap[i] = mx.addTrack(fmt)
                 }
             }
-            if (!hasVideo || trackMap.isEmpty()) {
+            if (!hasVideo) {
                 dst.delete()
-                return false
+                return "لا توجد صورة فيديو"
             }
 
             mx.start()
@@ -57,7 +82,8 @@ object Remux {
                 if (size < 0) break
                 val flags =
                     if ((ex.sampleFlags and MediaExtractor.SAMPLE_FLAG_SYNC) != 0) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
-                info.set(0, size, maxOf(0L, ex.sampleTime), flags)
+                val t = (ex.sampleTime - base).coerceAtLeast(0L)
+                info.set(0, size, t, flags)
                 val outTrack = trackMap[track]
                 if (outTrack != null) mx.writeSampleData(outTrack, buf, info)
                 ex.advance()
@@ -65,10 +91,10 @@ object Remux {
 
             mx.stop()
             started = false
-            return dst.exists() && dst.length() > 0
+            return if (dst.exists() && dst.length() > 0) null else "ملف فارغ"
         } catch (e: Exception) {
             dst.delete()
-            return false
+            return "الكتابة: ${e.javaClass.simpleName}"
         } finally {
             try {
                 if (started) mux?.stop()
@@ -78,37 +104,6 @@ object Remux {
                 mux?.release()
             } catch (_: Exception) {
             }
-            try {
-                ex.release()
-            } catch (_: Exception) {
-            }
-        }
-    }
-
-    /** اسم ترميز الفيديو داخل الملف، أو نص فارغ إن تعذر. */
-    fun videoCodec(path: String): String {
-        val ex = MediaExtractor()
-        return try {
-            ex.setDataSource(path)
-            var name = ""
-            for (i in 0 until ex.trackCount) {
-                val mime = ex.getTrackFormat(i).getString(MediaFormat.KEY_MIME) ?: continue
-                if (mime.startsWith("video/")) {
-                    name = when {
-                        mime.contains("avc") -> "H.264"
-                        mime.contains("hevc") -> "H.265 (HEVC)"
-                        mime.contains("vp9") -> "VP9"
-                        mime.contains("vp8") -> "VP8"
-                        mime.contains("av01") || mime.contains("av1") -> "AV1"
-                        else -> mime
-                    }
-                    break
-                }
-            }
-            name
-        } catch (e: Exception) {
-            ""
-        } finally {
             try {
                 ex.release()
             } catch (_: Exception) {
