@@ -12,7 +12,8 @@ class App : Application() {
             try {
                 YoutubeDL.getInstance().init(this)
                 FFmpeg.getInstance().init(this)
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
+                initError = e.message ?: e.javaClass.simpleName
                 Log.e("VideoDL", "init failed", e)
             }
         }.also { it.start() }
@@ -20,5 +21,8 @@ class App : Application() {
 
     companion object {
         lateinit var initThread: Thread
+
+        @Volatile
+        var initError: String? = null
     }
 }
