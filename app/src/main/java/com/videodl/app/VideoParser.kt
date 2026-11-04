@@ -27,6 +27,7 @@ private class Fmt(
     val ext: String,
     val vcodec: String,
     val acodec: String,
+    val protocol: String,
     val width: Int,
     val height: Int,
     val tbr: Double,
@@ -34,12 +35,13 @@ private class Fmt(
     val size: Long
 ) {
     val res: Int get() = if (width > 0 && height > 0) min(width, height) else height
+    val isHls: Boolean get() = protocol.startsWith("m3u8")
 }
 
 private fun JSONObject.str(k: String): String = if (isNull(k)) "" else optString(k, "")
 private fun JSONObject.dbl(k: String): Double = if (isNull(k)) 0.0 else optDouble(k, 0.0)
 
-// 3 = H.264 (الأكثر توافقاً) ، 2 = HEVC/غير معروف ، 1 = VP9 ، 0 = AV1 (لا تعمل على كثير من الهواتف)
+// 3 = H.264 (الأكثر توافقاً) ، 2 = HEVC/غير معروف ، 1 = VP9 ، 0 = AV1
 private fun codecScore(v: String): Int {
     val c = v.lowercase()
     return when {
@@ -94,6 +96,7 @@ object VideoParser {
                     ext = o.str("ext"),
                     vcodec = o.str("vcodec"),
                     acodec = o.str("acodec"),
+                    protocol = o.str("protocol"),
                     width = o.dbl("width").toInt(),
                     height = o.dbl("height").toInt(),
                     tbr = o.dbl("tbr"),
@@ -106,10 +109,12 @@ object VideoParser {
         val vids = fmts.filter { it.vcodec != "none" && it.height > 0 && it.ext != "mhtml" }
         val auds = fmts.filter { it.vcodec == "none" && it.acodec != "none" && it.acodec.isNotEmpty() }
 
+        // الصوت: AAC (m4a) أولاً، ثم الروابط العادية قبل HLS، ثم الأعلى جودة
         val bestAudio = auds.sortedWith(
             compareByDescending<Fmt> {
                 if (it.acodec.lowercase().startsWith("mp4a") || it.ext == "m4a") 1 else 0
-            }.thenByDescending { maxOf(it.abr, it.tbr) }
+            }.thenBy { if (it.isHls) 1 else 0 }
+                .thenByDescending { maxOf(it.abr, it.tbr) }
         ).firstOrNull()
 
         // نستبعد الترميزات غير المتوافقة (AV1/VP9) إذا وُجد H.264 أو HEVC
@@ -119,8 +124,13 @@ object VideoParser {
 
         val qualities = ArrayList<Quality>()
         pool.groupBy { it.res }.keys.sortedDescending().forEach { res ->
+            // الترميز الأفضل، ثم الرابط العادي قبل HLS (HLS ينتج ملفات ببداية زمنية غريبة)، ثم الأعلى جودة
             val v = pool.filter { it.res == res }
-                .sortedWith(compareByDescending<Fmt> { codecScore(it.vcodec) }.thenByDescending { it.tbr })
+                .sortedWith(
+                    compareByDescending<Fmt> { codecScore(it.vcodec) }
+                        .thenBy { if (it.isHls) 1 else 0 }
+                        .thenByDescending { it.tbr }
+                )
                 .first()
             val hasAudio = v.acodec != "none"
             val a = if (hasAudio) null else bestAudio
