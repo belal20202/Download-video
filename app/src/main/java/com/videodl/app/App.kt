@@ -8,6 +8,8 @@ import com.yausername.youtubedl_android.YoutubeDL
 class App : Application() {
     override fun onCreate() {
         super.onCreate()
+        // حالة التطبيق تعيش مع العملية، فتبقى سليمة عند تدوير الشاشة أو الخروج والعودة أثناء التحميل
+        vm = MainVM(this)
         initThread = Thread {
             try {
                 YoutubeDL.getInstance().init(this)
@@ -21,6 +23,7 @@ class App : Application() {
 
     companion object {
         lateinit var initThread: Thread
+        lateinit var vm: MainVM
 
         @Volatile
         var initError: String? = null
