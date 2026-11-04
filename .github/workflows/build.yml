@@ -8,7 +8,11 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
     steps:
       - uses: actions/checkout@v4
 
@@ -21,11 +25,27 @@ jobs:
         with:
           gradle-version: 8.9
 
-      - name: Build debug APK (auto retry)
+      # الاختبارات لا توقف البناء حالياً (لأنها لم تُجرَّب بعد). بعد أن تنجح مرة، احذف السطر continue-on-error
+      - name: Unit tests
+        continue-on-error: true
+        run: gradle testDebugUnitTest --no-daemon
+
+      - name: Prepare signing key
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+            echo "BUILD_TYPE=Release" >> "$GITHUB_ENV"
+          else
+            echo "::warning::No signing key found. Building a DEBUG apk (not for sharing)."
+            echo "BUILD_TYPE=Debug" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build APK (auto retry)
         run: |
           for i in 1 2 3; do
-            echo "=== Attempt $i ==="
-            if gradle assembleDebug --no-daemon --stacktrace; then
+            echo "=== Attempt $i ($BUILD_TYPE) ==="
+            if gradle assemble${BUILD_TYPE} --no-daemon --stacktrace; then
               exit 0
             fi
             echo "Build failed, retrying in 20 seconds..."
@@ -36,5 +56,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: VideoDL-apk
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/**/*.apk
           if-no-files-found: error
