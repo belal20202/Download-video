@@ -31,6 +31,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
@@ -240,6 +241,7 @@ fun HomeScreen(vm: MainVM) {
     val m = vm.meta
 
     var showPrivacy by rememberSaveable { mutableStateOf(false) }
+    var showUpdateConfirm by rememberSaveable { mutableStateOf(false) }
 
     Box(
         Modifier
@@ -288,7 +290,7 @@ fun HomeScreen(vm: MainVM) {
                 Text("الصق رابط الفيديو", color = Color.White, fontWeight = FontWeight.Bold, fontSize = 16.sp)
                 OutlinedTextField(
                     value = vm.url,
-                    onValueChange = { vm.url = it },
+                    onValueChange = { vm.onUrlChange(it) },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true,
                     shape = RoundedCornerShape(16.dp),
@@ -303,7 +305,7 @@ fun HomeScreen(vm: MainVM) {
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                     GhostButton("لصق", Modifier.weight(1f)) {
-                        clipboard.getText()?.text?.let { vm.url = it.trim() }
+                        clipboard.getText()?.text?.let { vm.onUrlChange(it.trim()) }
                     }
                     GradientButton(
                         if (vm.busy) "جارٍ العمل..." else "تعرّف على الفيديو",
@@ -455,9 +457,18 @@ fun HomeScreen(vm: MainVM) {
                 Text(vm.status, color = color, fontSize = 14.sp, lineHeight = 22.sp)
             }
 
+            // ---- تنزيل نسخة متوافقة (بموافقتك فقط)
+            if (vm.offerCompat && !vm.downloading) {
+                GradientButton(
+                    "↺   تنزيل نسخة متوافقة مع المعرض (720p)",
+                    Modifier.fillMaxWidth(),
+                    colors = listOf(Color(0xFFB8860B), Color(0xFF8A6508))
+                ) { vm.downloadCompatible() }
+            }
+
             // ---- تشغيل الملف بعد الحفظ
             val saved = vm.savedUri
-            if (saved != null) {
+            if (saved != null && !vm.downloading) {
                 GhostButton("▶   تشغيل الملف", Modifier.fillMaxWidth()) {
                     try {
                         ctx.startActivity(
@@ -470,8 +481,8 @@ fun HomeScreen(vm: MainVM) {
                 }
             }
 
-            // ---- تحديث المحرك
-            TextButton(onClick = { vm.updateEngine() }, enabled = !vm.busy && !vm.downloading) {
+            // ---- تحديث المحرك (مع تأكيد)
+            TextButton(onClick = { showUpdateConfirm = true }, enabled = !vm.busy && !vm.downloading) {
                 Text("تحديث محرك التحميل (إذا توقف موقع عن العمل)", color = TextDim, fontSize = 12.sp)
             }
             Spacer(Modifier.height(12.dp))
@@ -481,5 +492,32 @@ fun HomeScreen(vm: MainVM) {
     // ---- نافذة سياسة الخصوصية
     if (showPrivacy) {
         PrivacyDialog(onClose = { showPrivacy = false })
+    }
+
+    // ---- تأكيد تحديث المحرك
+    if (showUpdateConfirm) {
+        AlertDialog(
+            onDismissRequest = { showUpdateConfirm = false },
+            containerColor = Panel2,
+            title = { Text("تحديث محرك التحميل", color = Color.White, fontWeight = FontWeight.Bold) },
+            text = {
+                Text(
+                    "سيتم تنزيل نسخة أحدث من أداة yt-dlp (مفتوحة المصدر) من موقعها الرسمي على GitHub ثم تشغيلها داخل التطبيق. " +
+                        "لا تُرسل أي بيانات شخصية. هل تريد المتابعة؟",
+                    color = Color(0xFFD7DEE8),
+                    fontSize = 14.sp,
+                    lineHeight = 23.sp
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showUpdateConfirm = false
+                    vm.updateEngine()
+                }) { Text("متابعة", color = IqGreen, fontWeight = FontWeight.Bold) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUpdateConfirm = false }) { Text("إلغاء", color = TextDim) }
+            }
+        )
     }
 }
