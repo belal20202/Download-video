@@ -5,6 +5,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.media.MediaMetadataRetriever
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.provider.MediaStore
 import androidx.compose.runtime.getValue
@@ -26,8 +27,29 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-internal class Probe(val width: Int, val height: Int, val durationMs: Long, val hasAudio: Boolean)
+internal class Probe(
+    val width: Int,
+    val height: Int,
+    val durationMs: Long,
+    val hasAudio: Boolean,
+    val frameOk: Boolean
+)
+
+internal class Attempt(
+    val file: File,
+    val probe: Probe,
+    val report: Compat.Report?,
+    val problems: List<String>,
+    val prep: String
+)
+
 internal class Saved(val uri: Uri, val mime: String, val info: String)
+
+// نسخة أكثر توافقاً: H.264 + AAC حتى 720p و30 إطار
+private const val SAFE_FORMAT =
+    "bv*[vcodec^=avc1][height<=?720][fps<=?30]+ba[acodec^=mp4a]/" +
+        "b[vcodec^=avc1][acodec^=mp4a][height<=?720]/" +
+        "b[ext=mp4][height<=?720]/b[ext=mp4]"
 
 class MainVM(app: Application) : AndroidViewModel(app) {
     var url by mutableStateOf("")
@@ -52,6 +74,11 @@ class MainVM(app: Application) : AndroidViewModel(app) {
     private fun extractUrl(text: String): String? =
         Regex("https?://\\S+").find(text.trim())?.value
 
+    private fun awaitEngine() {
+        App.initThread.join()
+        App.initError?.let { throw IllegalStateException("تعذر تشغيل محرك التحميل: $it") }
+    }
+
     // ---------------------------------------------------------------- التعرف على الفيديو
     fun fetch() {
         val u = extractUrl(url)
@@ -72,7 +99,7 @@ class MainVM(app: Application) : AndroidViewModel(app) {
             status = "جارٍ التعرف على الفيديو..."
             try {
                 val parsed = withContext(Dispatchers.IO) {
-                    App.initThread.join()
+                    awaitEngine()
                     val req = YoutubeDLRequest(u).apply {
                         addOption("--dump-single-json")
                         addOption("--no-playlist")
@@ -142,21 +169,88 @@ class MainVM(app: Application) : AndroidViewModel(app) {
     }
 
     private fun runDownload(ctx: Context, u: String, q: Quality, title: String): Saved {
-        App.initThread.join()
-        val tmp = File(ctx.cacheDir, "dl").apply { deleteRecursively(); mkdirs() }
+        awaitEngine()
+        val dirA = File(ctx.cacheDir, "dl")
+        val dirB = File(ctx.cacheDir, "dl_safe")
+
+        var chosen = attempt(u, q, dirA, false)
+        var fellBack = false
+
+        // إذا ظهرت مشكلة توافق، ننزّل تلقائياً نسخة أكثر توافقاً
+        if (chosen.problems.isNotEmpty() && !q.isAudioOnly) {
+            status = "⚠ ${chosen.problems.first()}\nجارٍ تنزيل نسخة أكثر توافقاً مع المعرض..."
+            progress = 0f
+            etaText = ""
+            val b: Attempt? = try {
+                attempt(u, q, dirB, true)
+            } catch (e: Exception) {
+                if (cancelled) throw e
+                null
+            }
+            if (b != null && b.problems.size < chosen.problems.size) {
+                chosen.file.delete()
+                chosen = b
+                fellBack = true
+            }
+        }
+
+        val f = chosen.file
+        val p = chosen.probe
+        val mime = when (f.extension.lowercase()) {
+            "mp4" -> "video/mp4"
+            "webm" -> "video/webm"
+            "mkv" -> "video/x-matroska"
+            "mp3" -> "audio/mpeg"
+            "m4a" -> "audio/mp4"
+            else -> "application/octet-stream"
+        }
+        val isAudio = mime.startsWith("audio")
+        val uri = saveToMediaStore(ctx, f, mime, isAudio, title)
+            ?: throw IllegalStateException("تعذر حفظ الملف على الجهاز")
+        dirA.deleteRecursively()
+        dirB.deleteRecursively()
+
+        val dur = fmtDuration(p.durationMs / 1000)
+        val sb = StringBuilder()
+        if (q.isAudioOnly) {
+            sb.append("ملف صوتي • المدة ").append(dur)
+        } else {
+            sb.append("الدقة الفعلية ${p.width}×${p.height} • المدة ").append(dur)
+            chosen.report?.let { if (it.summary.isNotEmpty()) sb.append("\n").append(it.summary) }
+            sb.append("\nتجهيز الملف: ").append(chosen.prep)
+            if (fellBack) sb.append("\n↺ تم تنزيل نسخة أكثر توافقاً تلقائياً (H.264 حتى 720p)")
+            if (chosen.problems.isNotEmpty()) {
+                sb.append("\n⚠ ").append(chosen.problems.joinToString("، "))
+                sb.append("\nاستخدم «تشغيل الملف» لمشاهدته")
+            }
+            if (!p.hasAudio) sb.append("\n⚠ هذا الفيديو بدون صوت")
+        }
+        return Saved(uri, mime, sb.toString())
+    }
+
+    /** ينزّل الملف ويجهّزه ويفحصه. safe = نسخة H.264/AAC حتى 720p. */
+    private fun attempt(u: String, q: Quality, dir: File, safe: Boolean): Attempt {
+        dir.deleteRecursively()
+        dir.mkdirs()
 
         val req = YoutubeDLRequest(u).apply {
             addOption("--no-playlist")
             addOption("--no-mtime")
+            addOption("--retries", "10")
+            addOption("--fragment-retries", "10")
             // اسم مؤقت بسيط لتجنب مشاكل الرموز في الأسماء
-            addOption("-o", "${tmp.absolutePath}/video.%(ext)s")
+            addOption("-o", "${dir.absolutePath}/video.%(ext)s")
             if (q.isAudioOnly) {
                 addOption("-f", q.formatId)
                 addOption("-x")
                 addOption("--audio-format", "mp3")
                 addOption("--audio-quality", "0")
             } else {
-                val f = if (q.audioId != null) "${q.formatId}+${q.audioId}" else q.formatId
+                val f = when {
+                    safe -> SAFE_FORMAT
+                    q.audioId != null -> "${q.formatId}+${q.audioId}"
+                    else -> q.formatId
+                }
                 addOption("-f", f)
                 addOption("--merge-output-format", "mp4")
                 addOption("--remux-video", "mp4")
@@ -164,7 +258,7 @@ class MainVM(app: Application) : AndroidViewModel(app) {
             }
         }
 
-        val stages = if (q.audioId != null) 2 else 1
+        val stages = if (safe || q.audioId != null) 2 else 1
         var stage = 0
         var last = 0f
         YoutubeDL.getInstance().execute(req, processId) { p, eta, _ ->
@@ -178,61 +272,42 @@ class MainVM(app: Application) : AndroidViewModel(app) {
 
         val okExt = setOf("mp4", "mp3", "m4a", "mkv", "webm")
         val inter = Regex("\\.f\\d+")
-        var f = tmp.listFiles()
+        var f = dir.listFiles()
             ?.filter { it.isFile && it.length() > 0 && it.extension.lowercase() in okExt && !inter.containsMatchIn(it.name) }
             ?.maxByOrNull { it.length() }
             ?: throw IllegalStateException("لم يكتمل التحميل أو الدمج. اضغط «تحديث محرك التحميل» ثم أعد المحاولة.")
 
-        // إعادة كتابة الحاوية بصيغة MP4 القياسية لأندرويد (بدون إعادة ترميز) لضمان عمله في المعرض
+        // إعادة كتابة الحاوية بصيغة MP4 القياسية لأندرويد (بدون إعادة ترميز)
+        var prep = "—"
         if (!q.isAudioOnly && f.extension.lowercase() == "mp4") {
             status = "جارٍ تجهيز الفيديو ليعمل في المعرض..."
             etaText = ""
-            val fixed = File(tmp, "fixed.mp4")
-            if (Remux.toStandardMp4(f, fixed) && probe(fixed) != null) {
+            val fixed = File(dir, "fixed.mp4")
+            val err = Remux.toStandardMp4(f, fixed)
+            if (err == null && probe(fixed, false) != null) {
                 f.delete()
                 f = fixed
+                prep = "تم ✓"
             } else {
                 fixed.delete()
+                prep = "لم يتم (${err ?: "ملف غير صالح"})"
             }
         }
 
-        // التحقق من أن الملف صالح للتشغيل فعلاً
-        val p = probe(f)
+        val p = probe(f, !q.isAudioOnly)
         if (p == null || (!q.isAudioOnly && p.height <= 0)) {
             f.delete()
             throw IllegalStateException("الملف الناتج غير صالح للتشغيل. جرّب جودة أخرى.")
         }
-        val codec = if (q.isAudioOnly) "" else Remux.videoCodec(f.absolutePath)
+        if (q.isAudioOnly) return Attempt(f, p, null, emptyList(), prep)
 
-        val mime = when (f.extension.lowercase()) {
-            "mp4" -> "video/mp4"
-            "webm" -> "video/webm"
-            "mkv" -> "video/x-matroska"
-            "mp3" -> "audio/mpeg"
-            "m4a" -> "audio/mp4"
-            else -> "application/octet-stream"
-        }
-        val isAudio = mime.startsWith("audio")
-        val uri = saveToMediaStore(ctx, f, mime, isAudio, title)
-            ?: throw IllegalStateException("تعذر حفظ الملف على الجهاز")
-        tmp.deleteRecursively()
-
-        val dur = fmtDuration(p.durationMs / 1000)
-        val info = if (q.isAudioOnly) {
-            "ملف صوتي • المدة $dur"
-        } else {
-            var s = "الدقة الفعلية ${p.width}×${p.height} • المدة $dur"
-            if (codec.isNotEmpty()) s += "\nالترميز: $codec"
-            if (codec == "VP9" || codec == "VP8" || codec == "AV1") {
-                s += "\n⚠ هذا الترميز قد لا يعمل في المعرض، استخدم «تشغيل الملف»"
-            }
-            if (!p.hasAudio) s += "\n⚠ هذا الفيديو بدون صوت"
-            s
-        }
-        return Saved(uri, mime, info)
+        val rep = Compat.check(f.absolutePath)
+        val problems = ArrayList(rep.problems)
+        if (!p.frameOk) problems += "تعذر استخراج صورة من الفيديو"
+        return Attempt(f, p, rep, problems, prep)
     }
 
-    private fun probe(f: File): Probe? {
+    private fun probe(f: File, wantFrame: Boolean): Probe? {
         val r = MediaMetadataRetriever()
         return try {
             r.setDataSource(f.absolutePath)
@@ -241,7 +316,18 @@ class MainVM(app: Application) : AndroidViewModel(app) {
             val w = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
             val h = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
             val a = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_HAS_AUDIO) == "yes"
-            Probe(w, h, d, a)
+            var frameOk = true
+            if (wantFrame) {
+                frameOk = try {
+                    val bmp = r.getFrameAtTime(0, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    val ok = bmp != null
+                    bmp?.recycle()
+                    ok
+                } catch (e: Exception) {
+                    false
+                }
+            }
+            Probe(w, h, d, a, frameOk)
         } catch (e: Exception) {
             null
         } finally {
@@ -252,7 +338,7 @@ class MainVM(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** الحفظ في قسم الفيديو/الصوت الرسمي حتى يتعرف عليه المعرض ويشغّله. */
+    /** الحفظ في قسم الفيديو/الصوت الرسمي ثم فهرسته ليتعرف عليه المعرض ويشغّله. */
     private fun saveToMediaStore(ctx: Context, f: File, mime: String, isAudio: Boolean, title: String): Uri? {
         val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
         val name = "VideoDL_$stamp.${f.extension.lowercase()}"
@@ -267,6 +353,7 @@ class MainVM(app: Application) : AndroidViewModel(app) {
             put(MediaStore.MediaColumns.MIME_TYPE, mime)
             put(MediaStore.MediaColumns.RELATIVE_PATH, if (isAudio) "Music/VideoDL" else "Movies/VideoDL")
             put(MediaStore.MediaColumns.IS_PENDING, 1)
+            if (!isAudio) put(MediaStore.Video.Media.DATE_TAKEN, System.currentTimeMillis())
         }
         val r = ctx.contentResolver
         val uri = r.insert(collection, values) ?: return null
@@ -280,6 +367,19 @@ class MainVM(app: Application) : AndroidViewModel(app) {
         values.clear()
         values.put(MediaStore.MediaColumns.IS_PENDING, 0)
         r.update(uri, values, null, null)
+
+        // فهرسة إجبارية ليحصل المعرض على المدة والأبعاد والصورة المصغّرة
+        try {
+            r.query(uri, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    val path = c.getString(0)
+                    if (!path.isNullOrEmpty()) {
+                        MediaScannerConnection.scanFile(ctx, arrayOf(path), arrayOf(mime), null)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
         return uri
     }
 
