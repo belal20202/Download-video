@@ -1,13 +1,16 @@
 package com.videodl.app
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color as AColor
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import androidx.activity.viewModels
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.core.tween
 import androidx.compose.material3.MaterialTheme
@@ -27,7 +30,10 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
-    private val vm: MainVM by viewModels()
+    private val vm: MainVM get() = App.vm
+
+    private val notifPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -35,6 +41,7 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(AColor.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(AColor.TRANSPARENT)
         )
+        askNotificationPermissionOnce()
         handleShare(intent)
         setContent {
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
@@ -50,12 +57,21 @@ class MainActivity : ComponentActivity() {
         handleShare(intent)
     }
 
+    /** إذن الإشعارات لإظهار تقدم التحميل. يُطلب مرة واحدة فقط. */
+    private fun askNotificationPermissionOnce() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        val prefs = getSharedPreferences("prefs", MODE_PRIVATE)
+        if (prefs.getBoolean("asked_notif", false)) return
+        prefs.edit().putBoolean("asked_notif", true).apply()
+        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
     private fun handleShare(i: Intent?) {
         if (i?.action == Intent.ACTION_SEND) {
             val text = i.getStringExtra(Intent.EXTRA_TEXT) ?: return
-            val link = Regex("https?://\\S+").find(text)?.value ?: return
-            vm.url = link
-            vm.fetch()
+            vm.receiveShared(text)
         }
     }
 }
