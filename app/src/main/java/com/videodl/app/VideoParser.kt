@@ -10,7 +10,9 @@ data class Quality(
     val formatId: String,
     val audioId: String?,
     val sizeBytes: Long,
-    val isAudioOnly: Boolean = false
+    val isAudioOnly: Boolean = false,
+    val fps: Int = 0,
+    val highFps: Boolean = false
 )
 
 data class VideoMeta(
@@ -30,12 +32,16 @@ private class Fmt(
     val protocol: String,
     val width: Int,
     val height: Int,
+    val fps: Double,
     val tbr: Double,
     val abr: Double,
     val size: Long
 ) {
     val res: Int get() = if (width > 0 && height > 0) min(width, height) else height
     val isHls: Boolean get() = protocol.startsWith("m3u8")
+
+    // أكثر من 30 إطاراً/ثانية: ملفات أكبر وكثير من الهواتف لا تشغّلها في المعرض
+    val highFps: Boolean get() = fps > 31.0
 }
 
 private fun JSONObject.str(k: String): String = if (isNull(k)) "" else optString(k, "")
@@ -99,6 +105,7 @@ object VideoParser {
                     protocol = o.str("protocol"),
                     width = o.dbl("width").toInt(),
                     height = o.dbl("height").toInt(),
+                    fps = o.dbl("fps"),
                     tbr = o.dbl("tbr"),
                     abr = o.dbl("abr"),
                     size = size
@@ -123,19 +130,29 @@ object VideoParser {
         else vids.filter { codecScore(it.vcodec) >= 1 }.ifEmpty { vids }
 
         val qualities = ArrayList<Quality>()
-        pool.groupBy { it.res }.keys.sortedDescending().forEach { res ->
-            // الترميز الأفضل، ثم الرابط العادي قبل HLS (HLS ينتج ملفات ببداية زمنية غريبة)، ثم الأعلى جودة
-            val v = pool.filter { it.res == res }
-                .sortedWith(
-                    compareByDescending<Fmt> { codecScore(it.vcodec) }
-                        .thenBy { if (it.isHls) 1 else 0 }
-                        .thenByDescending { it.tbr }
-                )
-                .first()
+
+        fun pick(list: List<Fmt>): Fmt = list.sortedWith(
+            compareByDescending<Fmt> { codecScore(it.vcodec) }
+                .thenBy { if (it.isHls) 1 else 0 }
+                .thenByDescending { it.tbr }
+        ).first()
+
+        fun add(v: Fmt, high: Boolean) {
             val hasAudio = v.acodec != "none"
             val a = if (hasAudio) null else bestAudio
             val size = estimate(v, duration) + (if (a != null) estimate(a, duration) else 0L)
-            qualities += Quality(resLabel(res), res, v.id, a?.id, size)
+            val label = resLabel(v.res) + (if (high) " • ${v.fps.toInt()}fps ⚠" else "")
+            qualities += Quality(label, v.res, v.id, a?.id, size, false, v.fps.toInt(), high)
+        }
+
+        pool.map { it.res }.distinct().sortedDescending().forEach { res ->
+            val group = pool.filter { it.res == res }
+            val normal = group.filter { !it.highFps }
+            val high = group.filter { it.highFps }
+            // النسخة العادية (30fps أو أقل) أولاً وهي الافتراضية
+            if (normal.isNotEmpty()) add(pick(normal), false)
+            // نسخة 60fps خيار منفصل عليه تحذير
+            if (high.isNotEmpty() && (normal.isEmpty() || res >= 720)) add(pick(high), true)
         }
 
         val audioSource = bestAudio ?: vids.filter { it.acodec != "none" }.maxByOrNull { it.tbr }
