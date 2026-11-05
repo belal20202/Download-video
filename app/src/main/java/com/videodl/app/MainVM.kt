@@ -161,9 +161,10 @@ class MainVM(private val app: Application) {
                 }
                 fetchedUrl = u
                 meta = parsed
+                // الافتراضي: أعلى دقة حتى 1080p بنسخة عادية (ليست 60fps)
                 selectedIndex = parsed.qualities
-                    .indexOfFirst { !it.isAudioOnly && it.res in 1..1080 }
-                    .coerceAtLeast(0)
+                    .indexOfFirst { !it.isAudioOnly && !it.highFps && it.res in 1..1080 }
+                    .let { if (it >= 0) it else 0 }
                 status = "تم التعرف على الفيديو. اختر الجودة ثم اضغط تحميل"
                 if (parsed.thumbnail.isNotEmpty()) {
                     launch(Dispatchers.IO) {
@@ -369,7 +370,7 @@ class MainVM(private val app: Application) {
             ?.maxByOrNull { it.length() }
             ?: throw IllegalStateException("لم يكتمل التحميل أو الدمج. اضغط «تحديث محرك التحميل» ثم أعد المحاولة.")
 
-        // إعادة كتابة الحاوية بصيغة MP4 القياسية لأندرويد (بدون إعادة ترميز)
+        // 1) إعادة كتابة الحاوية بصيغة MP4 القياسية لأندرويد (بدون إعادة ترميز)
         var prep = "—"
         if (!q.isAudioOnly && f.extension.lowercase() == "mp4") {
             status = "جارٍ تجهيز الفيديو ليعمل في المعرض..."
@@ -379,10 +380,30 @@ class MainVM(private val app: Application) {
             if (err == null && probe(fixed, false) != null) {
                 f.delete()
                 f = fixed
-                prep = "تم ✓"
+                prep = "إعادة الكتابة ✓"
             } else {
                 fixed.delete()
-                prep = "لم يتم (${err ?: "ملف غير صالح"})"
+                prep = "إعادة الكتابة: لم تتم (${err ?: "ملف غير صالح"})"
+            }
+
+            // 2) نقل فهرس الملف (moov) إلى بدايته
+            val fast = File(dir, "fast.mp4")
+            when (val r = Faststart.toFront(f, fast)) {
+                "ok" -> {
+                    if (probe(fast, false) != null) {
+                        f.delete()
+                        f = fast
+                        prep += " • الفهرس: نُقل للبداية ✓"
+                    } else {
+                        fast.delete()
+                        prep += " • الفهرس: فشل التحقق"
+                    }
+                }
+                "already" -> prep += " • الفهرس: في البداية ✓"
+                else -> {
+                    fast.delete()
+                    prep += " • الفهرس: تعذر ($r)"
+                }
             }
         }
 
