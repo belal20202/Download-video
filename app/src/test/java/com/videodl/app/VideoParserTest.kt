@@ -1,6 +1,7 @@
 package com.videodl.app
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -15,10 +16,11 @@ class VideoParserTest {
       "thumbnail": "https://example.com/t.jpg",
       "formats": [
         {"format_id":"140","ext":"m4a","vcodec":"none","acodec":"mp4a.40.2","abr":128,"tbr":128,"protocol":"https"},
-        {"format_id":"137","ext":"mp4","vcodec":"avc1.640028","acodec":"none","width":1920,"height":1080,"tbr":4000,"protocol":"https"},
-        {"format_id":"399","ext":"mp4","vcodec":"av01.0.08M.08","acodec":"none","width":1920,"height":1080,"tbr":2500,"protocol":"https"},
-        {"format_id":"248","ext":"webm","vcodec":"vp09.00.40.08","acodec":"none","width":1920,"height":1080,"tbr":2600,"protocol":"https"},
-        {"format_id":"hls-1080","ext":"mp4","vcodec":"avc1.640028","acodec":"mp4a.40.2","width":1920,"height":1080,"tbr":6000,"protocol":"m3u8_native"},
+        {"format_id":"137","ext":"mp4","vcodec":"avc1.640028","acodec":"none","width":1920,"height":1080,"fps":30,"tbr":4000,"protocol":"https"},
+        {"format_id":"299","ext":"mp4","vcodec":"avc1.64002a","acodec":"none","width":1920,"height":1080,"fps":60,"tbr":9000,"protocol":"https"},
+        {"format_id":"399","ext":"mp4","vcodec":"av01.0.08M.08","acodec":"none","width":1920,"height":1080,"fps":30,"tbr":2500,"protocol":"https"},
+        {"format_id":"248","ext":"webm","vcodec":"vp09.00.40.08","acodec":"none","width":1920,"height":1080,"fps":30,"tbr":2600,"protocol":"https"},
+        {"format_id":"hls-1080","ext":"mp4","vcodec":"avc1.640028","acodec":"mp4a.40.2","width":1920,"height":1080,"fps":30,"tbr":6000,"protocol":"m3u8_native"},
         {"format_id":"sb0","ext":"mhtml","vcodec":"none","acodec":"none","width":48,"height":27,"protocol":"mhtml"}
       ]
     }
@@ -31,7 +33,18 @@ class VideoParserTest {
         assertEquals("137", video.formatId)
         assertEquals("140", video.audioId)
         assertEquals(1080, video.res)
+        assertFalse(video.highFps)
         assertTrue(m.qualities.none { it.formatId == "399" || it.formatId == "248" || it.formatId == "hls-1080" })
+    }
+
+    @Test
+    fun sixtyFpsIsASeparateFlaggedOptionAfterTheNormalOne() {
+        val m = VideoParser.parse(sample)
+        val videos = m.qualities.filter { !it.isAudioOnly }
+        assertEquals(2, videos.size)
+        assertEquals("137", videos[0].formatId)
+        assertEquals("299", videos[1].formatId)
+        assertTrue(videos[1].highFps)
     }
 
     @Test
